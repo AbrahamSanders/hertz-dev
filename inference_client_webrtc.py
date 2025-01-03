@@ -17,15 +17,15 @@ from typing import List
 from streamlit_webrtc import WebRtcMode, webrtc_streamer
 
 class AudioClient:
-    def __init__(self, server_url="ws://localhost:8000", token_temp=None, categorical_temp=None, gaussian_temp=None):
+    def __init__(self, server_url="ws://localhost:8000", **sample_params):
         # Convert ws:// to http:// for the base URL
         self.base_url = server_url.replace("ws://", "http://")
         self.server_url = f"{server_url}/audio"
         self.sound_check = False
-        
-        # Set temperatures if provided
-        if any(t is not None for t in [token_temp, categorical_temp, gaussian_temp]):
-            response_message = self.set_temperature_and_echo(token_temp, categorical_temp, gaussian_temp)
+
+        # Set sample parameters if provided
+        if sample_params:
+            response_message = self.set_sample_params_and_echo(**sample_params)
             print(response_message)
 
         self.downsampler = torchaudio.transforms.Resample(STREAMING_SAMPLE_RATE, SAMPLE_RATE)
@@ -34,17 +34,31 @@ class AudioClient:
         self.in_buffer = None
         self.out_buffer = None
     
-    def set_temperature_and_echo(self, token_temp=None, categorical_temp=None, gaussian_temp=None, echo_testing = False):
-        """Send temperature settings to server"""
-        params = {}
-        if token_temp is not None:
-            params['token_temp'] = token_temp
-        if categorical_temp is not None:
-            params['categorical_temp'] = categorical_temp
-        if gaussian_temp is not None:
-            params['gaussian_temp'] = gaussian_temp
+    def set_sample_params_and_echo(
+        self, 
+        token_temp=None, 
+        categorical_temp=None, 
+        gaussian_temp=None, 
+        top_k=None,
+        top_p=None, 
+        min_p=None, 
+        typical_p=None,
+        repetition_penalty=None,
+    ):
+        """Send sample parameters to server"""
+        
+        params = {
+            "token_temp": token_temp,
+            "categorical_temp": categorical_temp,
+            "gaussian_temp": gaussian_temp,
+            "top_k": top_k,
+            "top_p": top_p,
+            "min_p": min_p,
+            "typical_p": typical_p,
+            "repetition_penalty": repetition_penalty,
+        }
             
-        response = requests.post(f"{self.base_url}/set_temperature", params=params)
+        response = requests.post(f"{self.base_url}/set_sample_params", params=params)
         response_message = response.json()['message']
         return response_message
     
@@ -187,6 +201,11 @@ if __name__ == "__main__":
     parser.add_argument('--token_temp', '-t1', type=float, help='Token (LM) temperature parameter')
     parser.add_argument('--categorical_temp', '-t2', type=float, help='Categorical (VAE) temperature parameter')
     parser.add_argument('--gaussian_temp', '-t3', type=float, help='Gaussian (VAE) temperature parameter')
+    parser.add_argument('--top_k', '-p1', type=int, help='Top-k sampling parameter')
+    parser.add_argument('--top_p', '-p2', type=float, help='Top-p sampling parameter')
+    parser.add_argument('--min_p', '-p3', type=float, help='Min-p sampling parameter')
+    parser.add_argument('--typical_p', '-p4', type=float, help='Typical-p sampling parameter')
+    parser.add_argument('--repetition_penalty', '-r1', type=float, help='Repetition penalty parameter')
     parser.add_argument('--server', '-s', default="ws://localhost:8000", 
                         help='Server URL (default: ws://localhost:8000)')
     parser.add_argument("--use_ice_servers", action="store_true", help="Use public STUN servers")
@@ -210,26 +229,43 @@ if __name__ == "__main__":
     To begin, click the START button below and allow microphone access.
     """)
 
-    audio_client = st.session_state.get("audio_client")
-    if audio_client is None:
-        audio_client = AudioClient(
-            server_url=args.server,
-            token_temp=args.token_temp,
-            categorical_temp=args.categorical_temp,
-            gaussian_temp=args.gaussian_temp
-        )
-        st.session_state.audio_client = audio_client
-
     with st.sidebar:
         st.markdown("## Inference Settings")
         token_temp_default = args.token_temp if args.token_temp is not None else 0.8
         token_temp = st.slider("Token Temperature", 0.05, 2.0, token_temp_default, step=0.05)
-        categorical_temp_default = args.categorical_temp if args.categorical_temp is not None else 0.4
+        categorical_temp_default = args.categorical_temp if args.categorical_temp is not None else 0.5
         categorical_temp = st.slider("Categorical Temperature", 0.01, 1.0, categorical_temp_default, step=0.01)
         gaussian_temp_default = args.gaussian_temp if args.gaussian_temp is not None else 0.1
         gaussian_temp = st.slider("Gaussian Temperature", 0.01, 1.0, gaussian_temp_default, step=0.01)
-        if st.button("Set Temperatures"):
-            response_message = audio_client.set_temperature_and_echo(token_temp, categorical_temp, gaussian_temp)
+        top_k_default = args.top_k if args.top_k is not None else 70
+        top_k = st.slider("Top-k Sampling", 0, 100, top_k_default, step=1)
+        top_p_default = args.top_p if args.top_p is not None else 0.99
+        top_p = st.slider("Top-p Sampling", 0.0, 1.0, top_p_default, step=0.01)
+        min_p_default = args.min_p if args.min_p is not None else 0.0
+        min_p = st.slider("Min-p Sampling", 0.0, 0.2, min_p_default, step=0.001)
+        typical_p_default = args.typical_p if args.typical_p is not None else 1.0
+        typical_p = st.slider("Typical-p Sampling", 0.0, 1.0, typical_p_default, step=0.01)
+        repetition_penalty_default = args.repetition_penalty if args.repetition_penalty is not None else 1.6
+        repetition_penalty = st.slider("Repetition Penalty", 0.1, 2.0, repetition_penalty_default, step=0.1)
+        
+        audio_client = st.session_state.get("audio_client")
+        if audio_client is None:
+            audio_client = AudioClient(
+                server_url=args.server,
+                token_temp=token_temp,
+                categorical_temp=categorical_temp,
+                gaussian_temp=gaussian_temp,
+                top_k=top_k,
+                top_p=top_p,
+                min_p=min_p,
+                typical_p=typical_p,
+                repetition_penalty=repetition_penalty,
+            )
+            st.session_state.audio_client = audio_client
+        if st.button("Set All Parameters"):
+            response_message = audio_client.set_sample_params_and_echo(
+                token_temp, categorical_temp, gaussian_temp, top_k, top_p, min_p, typical_p, repetition_penalty
+            )
             st.write(response_message)
 
         st.markdown("## Microphone Settings")

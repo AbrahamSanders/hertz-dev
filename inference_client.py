@@ -12,32 +12,48 @@ import requests
 import time
 
 class AudioClient:
-    def __init__(self, server_url="ws://localhost:8000", token_temp=None, categorical_temp=None, gaussian_temp=None):
+    def __init__(self, server_url="ws://localhost:8000", **sample_params):
         # Convert ws:// to http:// for the base URL
         self.base_url = server_url.replace("ws://", "http://")
         self.server_url = f"{server_url}/audio"
-        
-        # Set temperatures if provided
-        if any(t is not None for t in [token_temp, categorical_temp, gaussian_temp]):
-            self.set_temperature_and_echo(token_temp, categorical_temp, gaussian_temp)
+
+        # Set sample parameters if provided
+        if sample_params:
+            response_message = self.set_sample_params_and_echo(**sample_params)
+            print(response_message)
         
         # Initialize queues
         self.audio_queue = queue.Queue()
         self.output_queue = queue.Queue()
     
-    def set_temperature_and_echo(self, token_temp=None, categorical_temp=None, gaussian_temp=None, echo_testing = False):
-        """Send temperature settings to server"""
-        params = {}
-        if token_temp is not None:
-            params['token_temp'] = token_temp
-        if categorical_temp is not None:
-            params['categorical_temp'] = categorical_temp
-        if gaussian_temp is not None:
-            params['gaussian_temp'] = gaussian_temp
+    def set_sample_params_and_echo(
+        self, 
+        token_temp=None, 
+        categorical_temp=None, 
+        gaussian_temp=None, 
+        top_k=None,
+        top_p=None, 
+        min_p=None, 
+        typical_p=None,
+        repetition_penalty=None,
+    ):
+        """Send sample parameters to server"""
+
+        params = {
+            "token_temp": token_temp,
+            "categorical_temp": categorical_temp,
+            "gaussian_temp": gaussian_temp,
+            "top_k": top_k,
+            "top_p": top_p,
+            "min_p": min_p,
+            "typical_p": typical_p,
+            "repetition_penalty": repetition_penalty,
+        }
             
-        response = requests.post(f"{self.base_url}/set_temperature", params=params)
-        print(response.json()['message'])
-    
+        response = requests.post(f"{self.base_url}/set_sample_params", params=params)
+        response_message = response.json()['message']
+        return response_message
+
     def audio_callback(self, indata, frames, time, status):
         """This is called for each audio block"""
         if status:
@@ -139,6 +155,11 @@ if __name__ == "__main__":
     parser.add_argument('--token_temp', '-t1', type=float, help='Token (LM) temperature parameter')
     parser.add_argument('--categorical_temp', '-t2', type=float, help='Categorical (VAE) temperature parameter')
     parser.add_argument('--gaussian_temp', '-t3', type=float, help='Gaussian (VAE) temperature parameter')
+    parser.add_argument('--top_k', '-p1', type=int, help='Top-k sampling parameter')
+    parser.add_argument('--top_p', '-p2', type=float, help='Top-p sampling parameter')
+    parser.add_argument('--min_p', '-p3', type=float, help='Min-p sampling parameter')
+    parser.add_argument('--typical_p', '-p4', type=float, help='Typical-p sampling parameter')
+    parser.add_argument('--repetition_penalty', '-r1', type=float, help='Repetition penalty parameter')
     parser.add_argument('--server', '-s', default="ws://localhost:8000", 
                         help='Server URL (default: ws://localhost:8000)')
     
@@ -152,7 +173,12 @@ if __name__ == "__main__":
         server_url=args.server,
         token_temp=args.token_temp,
         categorical_temp=args.categorical_temp,
-        gaussian_temp=args.gaussian_temp
+        gaussian_temp=args.gaussian_temp,
+        top_k=args.top_k,
+        top_p=args.top_p,
+        min_p=args.min_p,
+        typical_p=args.typical_p,
+        repetition_penalty=args.repetition_penalty,
     )
     
     try:

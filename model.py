@@ -1,4 +1,5 @@
 from typing import Optional, Tuple
+from dataclasses import dataclass
 
 import torch as T
 import torch.nn as nn
@@ -8,6 +9,16 @@ from ioblocks import GaussianMixtureIOLayer, FSQ
 
 from transformer import Stack, ShapeRotator, Block as PerfBlock, GPTOutput, CACHE_FILL_VALUE, FFNN, Norm
 from tokenizer import make_tokenizer
+
+from transformers.generation import (
+    RepetitionPenaltyLogitsProcessor, 
+    TemperatureLogitsWarper, 
+    TopKLogitsWarper,
+    TopPLogitsWarper, 
+    MinPLogitsWarper, 
+    TypicalLogitsWarper, 
+    LogitsProcessorList,
+)
 
 
 from utils import si_module, exists, isnt, tqdm0, print0, default, print0_colored
@@ -211,6 +222,50 @@ class HertzDevModel(nn.Module):
 
         from_pretrained: Optional[Tuple[str, str]] = None
 
+    @dataclass
+    class SampleParams:
+        # Temps
+        token_temp: float = 0.8
+        categorical_temp: float = 0.5
+        gaussian_temp: float = 0.1
+
+        # Additional sampling params
+        top_k: int = 0
+        top_p: float = 1.0
+        min_p: float = 0.0
+        typical_p: float = 1.0
+
+        # Repetition penalty
+        repetition_penalty: float = 1.0
+
+        def update(
+            self,   
+            token_temp: Optional[float] = None,
+            categorical_temp: Optional[float] = None,
+            gaussian_temp: Optional[float] = None,
+            top_k: Optional[int] = None,
+            top_p: Optional[float] = None,
+            min_p: Optional[float] = None,
+            typical_p: Optional[float] = None,
+            repetition_penalty: Optional[float] = None,
+        ):
+            if exists(token_temp):
+                self.token_temp = token_temp
+            if exists(categorical_temp):
+                self.categorical_temp = categorical_temp
+            if exists(gaussian_temp):
+                self.gaussian_temp = gaussian_temp
+            if exists(top_k):
+                self.top_k = top_k
+            if exists(top_p):
+                self.top_p = top_p
+            if exists(min_p):
+                self.min_p = min_p
+            if exists(typical_p):
+                self.typical_p = typical_p
+            if exists(repetition_penalty):
+                self.repetition_penalty = repetition_penalty
+
     def __init__(self, c: Config):
         super().__init__()
 
@@ -300,6 +355,33 @@ class HertzDevModel(nn.Module):
         self.audio_cache = None
         self.audio_latent_cache = None
         self.use_audio_cache = False
+
+    def get_logits_processor(self, sample_params: SampleParams) -> LogitsProcessorList:
+        """
+        Based on _get_logits_processor method from transformers.generation.utils.
+        Ordering of the processors is identical to the original method.
+        """
+        logits_processor = LogitsProcessorList()
+        
+        if sample_params.repetition_penalty != 1.0:
+            logits_processor.append(RepetitionPenaltyLogitsProcessor(sample_params.repetition_penalty))
+        
+        if sample_params.token_temp != 1.0:
+            logits_processor.append(TemperatureLogitsWarper(sample_params.token_temp))
+        
+        if sample_params.top_k > 0:
+            logits_processor.append(TopKLogitsWarper(sample_params.top_k))
+
+        if sample_params.top_p < 1.0:
+            logits_processor.append(TopPLogitsWarper(sample_params.top_p))
+
+        if sample_params.min_p > 0.0:
+            logits_processor.append(MinPLogitsWarper(sample_params.min_p))
+
+        if sample_params.typical_p < 1.0:
+            logits_processor.append(TypicalLogitsWarper(sample_params.typical_p))
+        
+        return logits_processor
     
     @T.no_grad()
     def forward(self, data):
@@ -318,37 +400,61 @@ class HertzDevModel(nn.Module):
             return self.output(x)
         
     @T.no_grad()
-    def next_audio_from_audio(self, audio_data: T.Tensor, temps=(0.8, (0.5, 0.1))):
+    def next_audio_from_audio(
+        self, 
+        audio_data: T.Tensor, 
+        prev_tokens: T.LongTensor,
+        logits_processor: LogitsProcessorList,
+        sample_params: SampleParams,
+    ):
         latents_in = self.tokenize(audio_data)
-        next_latents = self.next_latent(latents_in, temps)
+        next_latents, next_token = self.next_latent(latents_in, prev_tokens, logits_processor, sample_params)
         next_model_latent = next_latents[..., self.c.latent_size:]
         audio_decoded = self.untokenize(next_model_latent)[..., -2000:]
-        return audio_decoded
-
+        return audio_decoded, next_token
         
     @T.no_grad()
-    def next_latent(self, model_input: T.Tensor, temps=(0.8, (0.5, 0.1))):
+    def next_latent(
+        self, 
+        model_input: T.Tensor, 
+        prev_tokens: T.LongTensor,
+        logits_processor: LogitsProcessorList,
+        sample_params: SampleParams,
+    ):
+        cat_gauss_temps = (sample_params.categorical_temp, sample_params.gaussian_temp)
 
         if self.c.split:
             logits1, logits2 = self.forward(model_input)
             next_logits1 = logits1[:, -1]
             next_logits2 = logits2[:, -1]
-            next_token1 = F.softmax(next_logits1 / temps[0], dim=-1).multinomial(1)
-            next_token2 = F.softmax(next_logits2 / temps[0], dim=-1).multinomial(1)
+            next_logits1 = logits_processor(prev_tokens[0], next_logits1)
+            next_logits2 = logits_processor(prev_tokens[1], next_logits2)
+            next_token1 = F.softmax(next_logits1, dim=-1).multinomial(1)
+            next_token2 = F.softmax(next_logits2, dim=-1).multinomial(1)
 
-            next_input = self.resynthesizer(model_input, next_tokens=(next_token1, next_token2), temps=temps[1])
+            next_input = self.resynthesizer(model_input, next_tokens=(next_token1, next_token2), temps=cat_gauss_temps)
+            next_token = (next_token1, next_token2)
+            
         else:
             logits = self.forward(model_input)
             next_logits = logits[:, -1]
-            next_token = F.softmax(next_logits / temps[0], dim=-1).multinomial(1)
+            next_logits = logits_processor(prev_tokens[0], next_logits)
+            next_token = F.softmax(next_logits, dim=-1).multinomial(1)
 
-            next_input = self.resynthesizer(model_input, next_tokens=next_token, temps=temps[1])
+            next_input = self.resynthesizer(model_input, next_tokens=next_token, temps=cat_gauss_temps)
+            next_token = (next_token,)
 
-        return next_input
+        return next_input, next_token
 
 
     @T.no_grad()
-    def completion(self, data: T.Tensor, temps=(0.8, (0.5, 0.1)), gen_len=None, use_cache=True) -> T.Tensor:
+    def completion(
+        self, 
+        data: T.Tensor, 
+        sample_params: SampleParams, 
+        gen_len=None, 
+        use_cache=True,
+    ) -> T.Tensor:
         """
         only accepts latent-space data.
         """
@@ -359,10 +465,15 @@ class HertzDevModel(nn.Module):
 
         target_len = min(data.shape[1] + default(gen_len, data.shape[1]), self.c.stack_config.seq_len)
         
+        logits_processor = self.get_logits_processor(sample_params)
+        prev_tokens = T.zeros((2 if self.c.split else 1, data.shape[0], 0), device=data.device, dtype=T.long)
+
         for _ in tqdm0(range(data.shape[1], target_len)):
             model_input = next_input if use_cache else generated
 
-            next_input = self.next_latent(model_input, temps)
+            next_input, next_token = self.next_latent(model_input, prev_tokens, logits_processor, sample_params)
+
+            prev_tokens = T.cat([prev_tokens, T.stack(next_token)], dim=-1)
     
             generated = T.cat([generated, next_input], dim=1)
 
@@ -441,3 +552,27 @@ def get_hertz_dev_config(is_split=True, use_pure_audio_ablation=False):
         split=is_split,
         from_pretrained=checkpoints[1],
     )
+
+def get_sample_params(        
+    token_temp: Optional[float] = None,
+    categorical_temp: Optional[float] = None,
+    gaussian_temp: Optional[float] = None,
+    top_k: Optional[int] = None,
+    top_p: Optional[float] = None,
+    min_p: Optional[float] = None,
+    typical_p: Optional[float] = None,
+    repetition_penalty: Optional[float] = None,
+):
+    sample_params = HertzDevModel.SampleParams()
+    sample_params.update(
+        token_temp=token_temp,
+        categorical_temp=categorical_temp,
+        gaussian_temp=gaussian_temp,
+        top_k=top_k,
+        top_p=top_p,
+        min_p=min_p,
+        typical_p=typical_p,
+        repetition_penalty=repetition_penalty,
+    )
+    return sample_params
+    

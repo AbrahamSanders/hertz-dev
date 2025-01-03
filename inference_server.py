@@ -16,12 +16,12 @@ import os
 from typing import Optional
 
 from utils import print_colored
-from model import get_hertz_dev_config
+from model import get_hertz_dev_config, get_sample_params
 
 
 argparse = argparse.ArgumentParser()
 
-argparse.add_argument('--prompt_path', type=str, default='./prompts/bob_mono.wav', help="""
+argparse.add_argument('--prompt_path', type=str, default='./prompts/bob_duo.wav', help="""
                       We highly recommend making your own prompt based on a conversation between you and another person.
                       bob_mono.wav seems to work better for two-channel than bob_stereo.wav.
                       """)
@@ -49,8 +49,15 @@ app.add_middleware(
 
 # Hyperparams or something.
 SAMPLE_RATE = 16000 # Don't change this
-TEMPS = (0.8, (0.4, 0.1)) # You can change this, but there's also an endpoint for it.
-REPLAY_SECONDS = 3 # What the user hears as context.
+SAMPLE_PARAMS = get_sample_params( # You can change these, but there's also an endpoint for it.
+    token_temp = 0.8,
+    top_k = 70,
+    top_p = 0.99, 
+    repetition_penalty = 1.6,
+)
+REPLAY_SECONDS = 8 # What the user hears as context.
+CACHE_LENGTH = 1024 # The model's memory length in tokens.
+TOKEN_HISTORY_LENGTH = CACHE_LENGTH # The number of past token ids visible to logits processors.
 
 class AudioProcessor:
     def __init__(self, model, prompt_path):
@@ -76,13 +83,22 @@ class AudioProcessor:
         self.loaded_audio = loaded_audio.to(device)
             
         with T.autocast(device_type=device, dtype=T.bfloat16), T.inference_mode():
-                self.model.init_cache(bsize=1, device=device, dtype=T.bfloat16, length=1024)
-                self.next_model_audio = self.model.next_audio_from_audio(self.loaded_audio.unsqueeze(0), temps=TEMPS)
+            self.model.init_cache(bsize=1, device=device, dtype=T.bfloat16, length=CACHE_LENGTH)
+            self.initialize_logits_processor()
+            self.prev_tokens = T.zeros((2, 1, 0), device=device, dtype=T.long)
+            self.next_model_audio, next_token = self.model.next_audio_from_audio(
+                self.loaded_audio.unsqueeze(0), self.prev_tokens, self.logits_processor, SAMPLE_PARAMS
+            )
+            self.prev_tokens = T.cat([self.prev_tokens, T.stack(next_token)], dim=-1)
         self.prompt_buffer = None
         self.prompt_position = 0
         self.chunks_until_live = int(self.replay_seconds * 8)
         self.initialize_prompt_buffer()
         print_colored("AudioProcessor state initialized", "green")
+
+    def initialize_logits_processor(self):
+        self.logits_processor = self.model.get_logits_processor(SAMPLE_PARAMS)
+        print_colored(f"Initialized logits processor with {SAMPLE_PARAMS}", "green")
 
     def initialize_prompt_buffer(self):
         self.recorded_audio = self.loaded_audio
@@ -109,10 +125,13 @@ class AudioProcessor:
         audio_tensor = T.cat([audio_tensor, self.next_model_audio], dim=1)
         
         with T.autocast(device_type=device, dtype=T.bfloat16), T.inference_mode():
-            curr_model_audio = self.model.next_audio_from_audio(
+            curr_model_audio, curr_token = self.model.next_audio_from_audio(
                 audio_tensor, 
-                temps=TEMPS
+                self.prev_tokens, 
+                self.logits_processor, 
+                SAMPLE_PARAMS,
             )
+            self.prev_tokens = T.cat([self.prev_tokens[..., -TOKEN_HISTORY_LENGTH+1:], T.stack(curr_token)], dim=-1)
         print(f"Recorded audio shape {self.recorded_audio.shape}, audio tensor shape {audio_tensor.shape}")
         self.recorded_audio = T.cat([self.recorded_audio.cpu(), audio_tensor.squeeze(0).cpu()], dim=-1)
 
@@ -128,17 +147,35 @@ class AudioProcessor:
         self.initialize_state(self.prompt_path)
         print_colored("Audio processor cleanup complete", "green")
 
-@app.post("/set_temperature")
-async def set_temperature(token_temp: Optional[float] = None, categorical_temp: Optional[float] = None, gaussian_temp: Optional[float] = None):
-    try:        
-        global TEMPS
-        TEMPS = (token_temp, (categorical_temp, gaussian_temp))
+@app.post("/set_sample_params")
+async def set_sample_params(
+    token_temp: Optional[float] = None, 
+    categorical_temp: Optional[float] = None, 
+    gaussian_temp: Optional[float] = None,
+    top_k: Optional[int] = None,
+    top_p: Optional[float] = None, 
+    min_p: Optional[float] = None, 
+    typical_p: Optional[float] = None,
+    repetition_penalty: Optional[float] = None,
+):
+    try:
+        global SAMPLE_PARAMS
+        SAMPLE_PARAMS.update(
+            token_temp=token_temp,
+            categorical_temp=categorical_temp,
+            gaussian_temp=gaussian_temp,
+            top_k=top_k,
+            top_p=top_p,
+            min_p=min_p,
+            typical_p=typical_p,
+            repetition_penalty=repetition_penalty,
+        )
+        audio_processor.initialize_logits_processor()
         
-        print_colored(f"Temperature updated to: {TEMPS}", "green")
-        return {"message": f"Temperature updated to: {TEMPS}", "status": "success"}
+        return {"message": f"Sample params updated to: {SAMPLE_PARAMS}", "status": "success"}
     except Exception as e:
-        print_colored(f"Error setting temperature: {str(e)}", "red")
-        return {"message": f"Error setting temperature: {str(e)}", "status": "error"}
+        print_colored(f"Error setting sample params: {str(e)}", "red")
+        return {"message": f"Error setting sample params: {str(e)}", "status": "error"}
 
 @app.websocket("/audio")
 async def websocket_endpoint(websocket: WebSocket):
@@ -158,8 +195,8 @@ async def websocket_endpoint(websocket: WebSocket):
             await websocket.send_text(f"data:audio/raw;base64,{processed_data}")
             
     except Exception as e:
-            print_colored(f"WebSocket error: {e}", "red")
-            print_colored(f"Full traceback:\n{traceback.format_exc()}", "red")
+        print_colored(f"WebSocket error: {e}", "red")
+        print_colored(f"Full traceback:\n{traceback.format_exc()}", "red")
     finally:
         audio_processor.cleanup()
         await websocket.close()
