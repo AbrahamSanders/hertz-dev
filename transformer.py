@@ -204,8 +204,15 @@ class GQA(nn.Module):
         cache_len = get_cache_len(kv_cache)
         q, k = self.shape_rotator.rotate(q, k, offset=cache_len)
         if exists(kv_cache):
-            k = T.cat([kv_cache[:, :cache_len, 0], k], dim=1)
-            v = T.cat([kv_cache[:, :cache_len, 1], v], dim=1)
+            if cache_len < kv_cache.size(1):
+                k = T.cat([kv_cache[:, :cache_len, 0], k], dim=1)
+                v = T.cat([kv_cache[:, :cache_len, 1], v], dim=1)
+            else:
+                # use attention sink to avoid degradation in sliding window cache
+                # https://arxiv.org/pdf/2309.17453
+                sink_len = 64
+                k = T.cat([kv_cache[:, :sink_len, 0], kv_cache[:, sink_len+1:, 0], k], dim=1)
+                v = T.cat([kv_cache[:, :sink_len, 1], kv_cache[:, sink_len+1:, 1], v], dim=1)
             kv_cache[:, :k.size(1), 0] = k
             kv_cache[:, :v.size(1), 1] = v
         x = self._sdpa(q, k, v)
